@@ -21,11 +21,28 @@ class DashboardController extends Controller
         $offlineSalesTotal = (float) OfflineTransaction::sum('total');
         $totalSales = $onlineSalesTotal + $offlineSalesTotal;
 
+        $startOfMonth = Carbon::now()->startOfMonth();
+        $monthOnlineSales = (float) Order::whereIn('status', ['Sudah Sampai', 'Selesai/Lunas'])
+            ->where('created_at', '>=', $startOfMonth)
+            ->sum('total');
+        $monthOfflineSales = (float) OfflineTransaction::where('date', '>=', $startOfMonth->toDateString())
+            ->sum('total');
+        $monthSalesTotal = $monthOnlineSales + $monthOfflineSales;
+
+        $indonesianMonths = [
+            1 => 'Januari', 2 => 'Februari', 3 => 'Maret', 4 => 'April',
+            5 => 'Mei', 6 => 'Juni', 7 => 'Juli', 8 => 'Agustus',
+            9 => 'September', 10 => 'Oktober', 11 => 'November', 12 => 'Desember',
+        ];
+        $monthLabel = ($indonesianMonths[(int) Carbon::now()->format('n')] ?? Carbon::now()->format('F')).' '.Carbon::now()->format('Y');
+
         $stats = [
             'products' => Product::count(),
             'orders' => Order::count(),
             'pending' => Order::where('status', 'Menunggu Konfirmasi')->count(),
             'sales' => $totalSales,
+            'month_sales' => $monthSalesTotal,
+            'month_label' => $monthLabel,
             'online_sales' => $onlineSalesTotal,
             'offline_sales' => $offlineSalesTotal,
             'online_pct' => $totalSales > 0 ? round(($onlineSalesTotal / $totalSales) * 100) : 0,
@@ -58,9 +75,13 @@ class DashboardController extends Controller
         $maxDailySales = $salesTrend->max('total') ?: 1;
 
         // Top 5 Best-Selling Products (Combined Online + Offline)
+        // Merge by product_id so renamed products are grouped correctly,
+        // then show the current name from the products table.
+        $currentProductNames = Product::pluck('name', 'id');
+
         $onlineTop = OrderItem::whereHas('order', function ($q) {
-                $q->whereIn('status', ['Sudah Sampai', 'Selesai/Lunas']);
-            })
+            $q->whereIn('status', ['Sudah Sampai', 'Selesai/Lunas']);
+        })
             ->select('product_id', 'name', DB::raw('SUM(quantity) as qty'), DB::raw('SUM(subtotal) as revenue'))
             ->groupBy('product_id', 'name')
             ->get();
@@ -71,22 +92,38 @@ class DashboardController extends Controller
 
         $mergedProducts = [];
         foreach ($onlineTop as $item) {
-            $key = $item->name;
-            $mergedProducts[$key] = [
-                'name' => $item->name,
-                'qty' => (int) $item->qty,
-                'revenue' => (float) $item->revenue,
-            ];
-        }
+            // Use product_id as key when available; fall back to stored name
+            $key = $item->product_id ?? 'name__'.$item->name;
+            $displayName = ($item->product_id && $currentProductNames->has($item->product_id))
+                ? $currentProductNames[$item->product_id]
+                : $item->name;
 
-        foreach ($offlineTop as $item) {
-            $key = $item->name;
             if (isset($mergedProducts[$key])) {
                 $mergedProducts[$key]['qty'] += (int) $item->qty;
                 $mergedProducts[$key]['revenue'] += (float) $item->revenue;
             } else {
                 $mergedProducts[$key] = [
-                    'name' => $item->name,
+                    'name' => $displayName,
+                    'qty' => (int) $item->qty,
+                    'revenue' => (float) $item->revenue,
+                ];
+            }
+        }
+
+        foreach ($offlineTop as $item) {
+            $key = $item->product_id ?? 'name__'.$item->name;
+            $displayName = ($item->product_id && $currentProductNames->has($item->product_id))
+                ? $currentProductNames[$item->product_id]
+                : $item->name;
+
+            if (isset($mergedProducts[$key])) {
+                $mergedProducts[$key]['qty'] += (int) $item->qty;
+                $mergedProducts[$key]['revenue'] += (float) $item->revenue;
+                // Always use the latest name from the products table
+                $mergedProducts[$key]['name'] = $displayName;
+            } else {
+                $mergedProducts[$key] = [
+                    'name' => $displayName,
                     'qty' => (int) $item->qty,
                     'revenue' => (float) $item->revenue,
                 ];
@@ -95,7 +132,18 @@ class DashboardController extends Controller
 
         $topProducts = collect($mergedProducts)->sortByDesc('qty')->take(5)->values();
 
-        $orders = Order::with('items')->latest()->take(6)->get();
+        $orders = Order::with('items')->orderByRaw("
+            CASE
+                WHEN status = 'Menunggu Konfirmasi' THEN 1
+                WHEN settlement_status = 'Menunggu Verifikasi Admin' THEN 2
+                WHEN status = 'Siap Dikirim' THEN 3
+                WHEN status = 'Sedang Diproduksi' THEN 4
+                WHEN status = 'Sedang Dikirim' THEN 5
+                WHEN status = 'Selesai/Lunas' THEN 6
+                WHEN status = 'Dibatalkan' THEN 7
+                ELSE 8
+            END ASC
+        ")->latest()->take(6)->get();
         $lowStock = Product::whereColumn('stock', '<=', 'min_stock')->orderBy('stock')->get();
         $expiringSoon = StockMutation::with('product')
             ->where('type', 'in')
@@ -118,4 +166,3 @@ class DashboardController extends Controller
         ));
     }
 }
-

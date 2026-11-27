@@ -4,29 +4,93 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\Order;
+use App\Models\Product;
+use App\Models\StockMutation;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
 
 class OrderController extends Controller
 {
     public const STATUSES = [
         'Menunggu Konfirmasi',
-        'Pembayaran DP Masuk',
-        'Pembayaran DP Disetujui',
         'Sedang Diproduksi',
         'Siap Dikirim',
         'Sedang Dikirim',
-        'Sudah Sampai',
         'Selesai/Lunas',
         'Dibatalkan',
     ];
 
-    public function index(): View
+    public function index(Request $request): View
     {
-        $orders = Order::with('items')->latest()->paginate(15);
+        $query = Order::with('items');
 
-        return view('admin.orders.index', ['orders' => $orders, 'statuses' => self::STATUSES]);
+        $selectedStatus = $request->query('status');
+        if (empty($selectedStatus) || $selectedStatus === 'active') {
+            $query->whereIn('status', [
+                'Menunggu Konfirmasi',
+                'Sedang Diproduksi',
+                'Siap Dikirim',
+                'Sedang Dikirim',
+            ]);
+            $selectedStatus = 'active';
+        } elseif ($selectedStatus !== 'all' && in_array($selectedStatus, self::STATUSES, true)) {
+            $query->where('status', $selectedStatus);
+        }
+
+        $startDate = $request->query('start_date');
+        $endDate = $request->query('end_date');
+
+        if (! empty($startDate)) {
+            $query->whereDate('created_at', '>=', $startDate);
+        }
+        if (! empty($endDate)) {
+            $query->whereDate('created_at', '<=', $endDate);
+        }
+
+        $selectedSort = $request->query('sort', 'priority');
+        if ($selectedSort === 'latest') {
+            $query->latest();
+        } elseif ($selectedSort === 'updated') {
+            $query->latest('updated_at');
+        } elseif ($selectedSort === 'oldest') {
+            $query->oldest();
+        } else {
+            // Default: 'priority' -> Urutkan berdasarkan status yang paling penting untuk ditindaklanjuti/diupdate admin:
+            // 1. Menunggu Konfirmasi (pesanan baru masuk)
+            // 2. Menunggu Verifikasi Admin (bukti pelunasan DP)
+            // 3. Siap Dikirim (siap kirim / perlu surat jalan & resi)
+            // 4. Sedang Diproduksi
+            // 5. Sedang Dikirim
+            // 6. Selesai/Lunas
+            // 7. Dibatalkan
+            // Untuk status yang sama, urutkan tanggal terbaru (created_at desc)
+            $query->orderByRaw("
+                CASE
+                    WHEN status = 'Menunggu Konfirmasi' THEN 1
+                    WHEN settlement_status = 'Menunggu Verifikasi Admin' THEN 2
+                    WHEN status = 'Siap Dikirim' THEN 3
+                    WHEN status = 'Sedang Diproduksi' THEN 4
+                    WHEN status = 'Sedang Dikirim' THEN 5
+                    WHEN status = 'Selesai/Lunas' THEN 6
+                    WHEN status = 'Dibatalkan' THEN 7
+                    ELSE 8
+                END ASC
+            ")->latest();
+            $selectedSort = 'priority';
+        }
+
+        $orders = $query->paginate(15)->withQueryString();
+
+        return view('admin.orders.index', [
+            'orders' => $orders,
+            'statuses' => self::STATUSES,
+            'currentStatus' => $selectedStatus,
+            'currentSort' => $selectedSort,
+            'startDate' => $startDate,
+            'endDate' => $endDate,
+        ]);
     }
 
     public function show(Order $order): View
@@ -63,15 +127,15 @@ class OrderController extends Controller
             'settlement_status' => ['nullable', 'string', 'in:Menunggu Verifikasi Admin,Lunas / Disetujui,Ditolak'],
         ]);
 
-        \Illuminate\Support\Facades\DB::transaction(function () use ($order, $validated, $request): void {
+        DB::transaction(function () use ($order, $validated): void {
             $shippedStatuses = ['Sedang Dikirim', 'Sudah Sampai', 'Selesai/Lunas'];
             if (in_array($validated['status'], $shippedStatuses, true) && ! $order->stock_deducted) {
                 foreach ($order->items as $item) {
                     if ($item->product_id) {
-                        $product = \App\Models\Product::find($item->product_id);
+                        $product = Product::find($item->product_id);
                         if ($product) {
                             $product->decrement('stock', $item->quantity);
-                            \App\Models\StockMutation::create([
+                            StockMutation::create([
                                 'product_id' => $product->id,
                                 'user_id' => auth()->id(),
                                 'admin_name' => auth()->user()?->name ?? 'Admin',
@@ -99,7 +163,7 @@ class OrderController extends Controller
                 $order->shipping_notes = $validated['shipping_notes'];
             }
 
-            if (!empty($validated['settlement_status'])) {
+            if (! empty($validated['settlement_status'])) {
                 $order->settlement_status = $validated['settlement_status'];
                 if ($validated['settlement_status'] === 'Lunas / Disetujui') {
                     $order->remaining = 0;
